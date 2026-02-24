@@ -11,9 +11,11 @@ public static class GaussianSplatInboxWatcher
 {
     private const string InboxFolderAssetPath = "Assets/PLY/inbox";
     private const string ProcessedFolderAssetPath = "Assets/PLY/processed";
+    private const string FailedFolderAssetPath = "Assets/PLY/failed";
     private const string OutputFolderAssetPath = "Assets/GaussianAssets";
 
     private const bool MoveProcessedFiles = true;
+    private const bool MoveFailedFiles = true;
     private const bool ImportCamerasJson = false;
     private const double PollIntervalSeconds = 30.0;
     private const double FileStableForSeconds = 5.0;
@@ -65,6 +67,10 @@ public static class GaussianSplatInboxWatcher
         s_IsScanRunning = true;
         try
         {
+            // Docker bind-mount writes can miss Unity file watcher notifications.
+            // Poll cycle forces a sync refresh so new external files become visible.
+            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+
             string inboxAbsolute = AssetPathToAbsolute(InboxFolderAssetPath);
             if (!Directory.Exists(inboxAbsolute))
                 return;
@@ -88,14 +94,16 @@ public static class GaussianSplatInboxWatcher
                 if (!TryConvertToGaussianAsset(filePath, out var errorMessage))
                 {
                     Debug.LogError($"[GaussianSplatInboxWatcher] Failed to convert '{filePath}': {errorMessage}");
-                    s_Observations[filePath] = FileObservation.From(fingerprint, EditorApplication.timeSinceStartup);
+                    if (MoveFailedFiles)
+                        MoveToFolder(filePath, FailedFolderAssetPath, "failed");
+                    s_Observations.Remove(filePath);
                     continue;
                 }
 
                 MarkProcessed(fingerprint);
 
                 if (MoveProcessedFiles)
-                    MoveToProcessedFolder(filePath);
+                    MoveToFolder(filePath, ProcessedFolderAssetPath, "processed");
 
                 Debug.Log($"[GaussianSplatInboxWatcher] Converted '{Path.GetFileName(filePath)}'.");
                 break;
@@ -170,7 +178,7 @@ public static class GaussianSplatInboxWatcher
         }
     }
 
-    private static void MoveToProcessedFolder(string sourceAbsolutePath)
+    private static void MoveToFolder(string sourceAbsolutePath, string destinationFolderAssetPath, string destinationLabel)
     {
         try
         {
@@ -181,14 +189,14 @@ public static class GaussianSplatInboxWatcher
                 return;
 
             AssetDatabase.ImportAsset(sourceAssetPath, ImportAssetOptions.ForceSynchronousImport);
-            string destinationAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{ProcessedFolderAssetPath}/{Path.GetFileName(sourceAbsolutePath)}");
+            string destinationAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{destinationFolderAssetPath}/{Path.GetFileName(sourceAbsolutePath)}");
             string moveError = AssetDatabase.MoveAsset(sourceAssetPath, destinationAssetPath);
             if (!string.IsNullOrEmpty(moveError))
-                Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not move '{sourceAssetPath}' to processed folder: {moveError}");
+                Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not move '{sourceAssetPath}' to {destinationLabel} folder: {moveError}");
         }
         catch (Exception ex)
         {
-            Debug.LogWarning($"[GaussianSplatInboxWatcher] Exception while moving processed file: {ex.Message}");
+            Debug.LogWarning($"[GaussianSplatInboxWatcher] Exception while moving file to {destinationLabel} folder: {ex.Message}");
         }
     }
 
@@ -277,6 +285,7 @@ public static class GaussianSplatInboxWatcher
         EnsureFolder("Assets", "PLY");
         EnsureFolder("Assets/PLY", "inbox");
         EnsureFolder("Assets/PLY", "processed");
+        EnsureFolder("Assets/PLY", "failed");
         EnsureFolder("Assets", "GaussianAssets");
     }
 
