@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
-using System.Linq;
 using UnityEditor;
 using UnityEngine;
 
@@ -17,15 +16,9 @@ public static class GaussianSplatInboxWatcher
     private const bool MoveProcessedFiles = true;
     private const bool MoveFailedFiles = true;
     private const bool ImportCamerasJson = false;
-    private const double PollIntervalSeconds = 30.0;
+    private const double PollIntervalSeconds = 10.0;
     private const double FileStableForSeconds = 5.0;
-
-    private static readonly string[] CreatorTypeCandidates =
-    {
-        "GaussianSplatting.Editor.GaussianSplatAssetCreator, GaussianSplattingEditor",
-        "GaussianSplatting.Editor.GaussianSplatAssetCreator, GaussianSplatting.Editor",
-        "GaussianSplatting.Editor.GaussianSplatAssetCreator",
-    };
+    private const string CreatorTypeName = "GaussianSplatting.Editor.GaussianSplatAssetCreator, GaussianSplattingEditor";
 
     private static readonly Dictionary<string, FileObservation> s_Observations = new(StringComparer.OrdinalIgnoreCase);
     private static readonly List<string> s_MissingObservationKeys = new();
@@ -119,10 +112,10 @@ public static class GaussianSplatInboxWatcher
     {
         errorMessage = string.Empty;
 
-        var creatorType = ResolveCreatorType();
+        var creatorType = Type.GetType(CreatorTypeName, throwOnError: false);
         if (creatorType == null)
         {
-            errorMessage = "Could not resolve type 'GaussianSplatting.Editor.GaussianSplatAssetCreator'.";
+            errorMessage = $"Could not resolve type '{CreatorTypeName}'.";
             return false;
         }
 
@@ -159,14 +152,9 @@ public static class GaussianSplatInboxWatcher
 
             return true;
         }
-        catch (TargetInvocationException tie)
-        {
-            errorMessage = tie.InnerException?.Message ?? tie.Message;
-            return false;
-        }
         catch (Exception ex)
         {
-            errorMessage = ex.Message;
+            errorMessage = ex is TargetInvocationException tie ? (tie.InnerException?.Message ?? tie.Message) : ex.Message;
             return false;
         }
         finally
@@ -180,24 +168,17 @@ public static class GaussianSplatInboxWatcher
 
     private static void MoveToFolder(string sourceAbsolutePath, string destinationFolderAssetPath, string destinationLabel)
     {
-        try
-        {
-            EnsureAssetFolders();
+        EnsureAssetFolders();
 
-            string sourceAssetPath = AbsoluteToAssetPath(sourceAbsolutePath);
-            if (string.IsNullOrEmpty(sourceAssetPath))
-                return;
+        string sourceAssetPath = AbsoluteToAssetPath(sourceAbsolutePath);
+        if (string.IsNullOrEmpty(sourceAssetPath))
+            return;
 
-            AssetDatabase.ImportAsset(sourceAssetPath, ImportAssetOptions.ForceSynchronousImport);
-            string destinationAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{destinationFolderAssetPath}/{Path.GetFileName(sourceAbsolutePath)}");
-            string moveError = AssetDatabase.MoveAsset(sourceAssetPath, destinationAssetPath);
-            if (!string.IsNullOrEmpty(moveError))
-                Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not move '{sourceAssetPath}' to {destinationLabel} folder: {moveError}");
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"[GaussianSplatInboxWatcher] Exception while moving file to {destinationLabel} folder: {ex.Message}");
-        }
+        AssetDatabase.ImportAsset(sourceAssetPath, ImportAssetOptions.ForceSynchronousImport);
+        string destinationAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{destinationFolderAssetPath}/{Path.GetFileName(sourceAbsolutePath)}");
+        string moveError = AssetDatabase.MoveAsset(sourceAssetPath, destinationAssetPath);
+        if (!string.IsNullOrEmpty(moveError))
+            Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not move '{sourceAssetPath}' to {destinationLabel} folder: {moveError}");
     }
 
     private static bool IsStable(string filePath, FileFingerprint fingerprint)
@@ -407,21 +388,6 @@ public static class GaussianSplatInboxWatcher
             throw new MissingMethodException(type.FullName, methodName);
 
         method.Invoke(instance, null);
-    }
-
-    private static Type ResolveCreatorType()
-    {
-        foreach (var candidate in CreatorTypeCandidates)
-        {
-            var type = Type.GetType(candidate, throwOnError: false);
-            if (type != null)
-                return type;
-        }
-
-        return AppDomain.CurrentDomain
-            .GetAssemblies()
-            .Select(asm => asm.GetType("GaussianSplatting.Editor.GaussianSplatAssetCreator", throwOnError: false))
-            .FirstOrDefault(type => type != null);
     }
 
     [Serializable]
