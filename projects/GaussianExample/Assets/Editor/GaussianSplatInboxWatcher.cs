@@ -234,8 +234,9 @@ public static class GaussianSplatInboxWatcher
 
             return !string.IsNullOrWhiteSpace(fingerprint.RelativePath);
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not fingerprint '{filePath}': {ex.GetType().Name}: {ex.Message}");
             return false;
         }
     }
