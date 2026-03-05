@@ -105,6 +105,6 @@ into Unity is just "MIT license", you need to separately consider *how* did you 
 
 # Auto ply Parser
 
-## 1. Import **GaussianExample** in Unity Hub
+### 1. Import **GaussianExample** in Unity Hub
 
-## 2. Use **Inbox** folder for new .ply Gaussian Splats
+### 2. Use **Inbox** folder for new .ply Gaussian Splats
