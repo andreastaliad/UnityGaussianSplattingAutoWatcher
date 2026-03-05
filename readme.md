@@ -102,3 +102,9 @@ However, keep in mind that the [license of the original paper implementation](ht
 says that the official _training_ software for the Gaussian Splats is for educational / academic / non-commercial
 purpose; commercial usage requires getting license from INRIA. That is: even if this viewer / integration
 into Unity is just "MIT license", you need to separately consider *how* did you get your Gaussian Splat PLY files.
+
+# Auto ply Parser
+
+## 1. Import **GaussianExample** in Unity Hub
+
+## 2. Use **Inbox** folder for new .ply Gaussian Splats
