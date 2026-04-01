@@ -103,8 +103,14 @@ says that the official _training_ software for the Gaussian Splats is for educat
 purpose; commercial usage requires getting license from INRIA. That is: even if this viewer / integration
 into Unity is just "MIT license", you need to separately consider *how* did you get your Gaussian Splat PLY files.
 
-# Auto ply Parser
+# Auto ply Parser(RabbitMQ)
 
 ### 1. Import **GaussianExample** in Unity Hub
+
+### 2. Download NuGet package manager and import it to unity via (Assets>Import Package>Custom Package...) and select  your downloaded .unitypackage from (https://www.nuget.org/api/v2/package/RabbitMQ.Client/7.2.1)
+
+### 3. Install RabbitMQ Client (NuGet>Manage NuGet Packages) Search for RabbitMQ.Client and install version 7.2.1 (not tested on other versions)
+
+### 4. Send render jobs via RabbitMQ broker!
 
 ### 2. Use **Inbox** folder for new .ply Gaussian Splats
