@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Text;
+using System.Threading;
+using RabbitMQ.Client;
 using UnityEditor;
 using UnityEngine;
 
@@ -17,11 +20,16 @@ public static class GaussianSplatInboxWatcher
     private const bool MoveFailedFiles = true;
     private const bool ImportCamerasJson = false;
     private const double PollIntervalSeconds = 10.0;
-    private const double FileStableForSeconds = 5.0;
     private const string CreatorTypeName = "GaussianSplatting.Editor.GaussianSplatAssetCreator, GaussianSplattingEditor";
 
-    private static readonly Dictionary<string, FileObservation> s_Observations = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly List<string> s_MissingObservationKeys = new();
+    private const string RabbitMqHost = "localhost";
+    private const int RabbitMqPort = 5672;
+    private const string RabbitMqUser = "guest";
+    private const string RabbitMqPass = "guest";
+    private const string RabbitMqVirtualHost = "/";
+    private const string RabbitMqQueueName = "gaussian.ply.inbox";
+    private const bool RabbitMqQueueDurable = true;
+
     private static readonly List<ProcessedEntry> s_ProcessedEntries = new();
     private static readonly HashSet<string> s_ProcessedKeys = new(StringComparer.Ordinal);
 
@@ -30,6 +38,9 @@ public static class GaussianSplatInboxWatcher
 
     private static bool s_IsScanRunning;
     private static double s_NextPollAt;
+    private static IConnection s_RabbitConnection;
+    private static IChannel s_RabbitChannel;
+    private static bool s_RabbitReady;
 
     static GaussianSplatInboxWatcher()
     {
@@ -37,6 +48,7 @@ public static class GaussianSplatInboxWatcher
         EnsureAssetFolders();
         s_NextPollAt = EditorApplication.timeSinceStartup + 2.0;
         EditorApplication.update += OnEditorUpdate;
+        AssemblyReloadEvents.beforeAssemblyReload += DisposeRabbitMq;
     }
 
     private static void OnEditorUpdate()
@@ -60,37 +72,50 @@ public static class GaussianSplatInboxWatcher
         s_IsScanRunning = true;
         try
         {
-            // Docker bind-mount writes can miss Unity file watcher notifications.
-            // Poll cycle forces a sync refresh so new external files become visible.
-            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
-
-            string inboxAbsolute = AssetPathToAbsolute(InboxFolderAssetPath);
-            if (!Directory.Exists(inboxAbsolute))
+            if (!TryInitializeRabbitMq())
                 return;
 
-            var plyFiles = Directory.GetFiles(inboxAbsolute, "*.ply", SearchOption.TopDirectoryOnly);
-            Array.Sort(plyFiles, StringComparer.OrdinalIgnoreCase);
+            var delivery = s_RabbitChannel
+                .BasicGetAsync(RabbitMqQueueName, autoAck: false, cancellationToken: CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+            if (delivery == null)
+                return;
 
-            CleanupMissingObservations(plyFiles);
+            ulong deliveryTag = delivery.DeliveryTag;
 
-            foreach (var filePath in plyFiles)
+            try
             {
+                string message = Encoding.UTF8.GetString(delivery.Body.ToArray()).Trim();
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    s_RabbitChannel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+                    return;
+                }
+
+                string filePath = ResolveIncomingPath(message);
                 if (!TryGetFingerprint(filePath, out var fingerprint))
-                    continue;
+                {
+                    Debug.LogWarning($"[GaussianSplatInboxWatcher] Queue message did not resolve to a valid file: '{message}'.");
+                    s_RabbitChannel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+                    return;
+                }
 
                 if (s_ProcessedKeys.Contains(MakeProcessedKey(fingerprint)))
-                    continue;
+                {
+                    s_RabbitChannel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+                    return;
+                }
 
-                if (!IsStable(filePath, fingerprint))
-                    continue;
+                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
 
                 if (!TryConvertToGaussianAsset(filePath, out var errorMessage))
                 {
                     Debug.LogError($"[GaussianSplatInboxWatcher] Failed to convert '{filePath}': {errorMessage}");
                     if (MoveFailedFiles)
                         MoveToFolder(filePath, FailedFolderAssetPath, "failed");
-                    s_Observations.Remove(filePath);
-                    continue;
+                    s_RabbitChannel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+                    return;
                 }
 
                 MarkProcessed(fingerprint);
@@ -99,12 +124,76 @@ public static class GaussianSplatInboxWatcher
                     MoveToFolder(filePath, ProcessedFolderAssetPath, "processed");
 
                 Debug.Log($"[GaussianSplatInboxWatcher] Converted '{Path.GetFileName(filePath)}'.");
-                break;
+                s_RabbitChannel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[GaussianSplatInboxWatcher] Queue message handling failed: {ex.Message}");
+                s_RabbitChannel.BasicNackAsync(deliveryTag, multiple: false, requeue: true, cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
             }
         }
         finally
         {
             s_IsScanRunning = false;
+        }
+    }
+
+    private static bool TryInitializeRabbitMq()
+    {
+        if (s_RabbitReady && s_RabbitConnection?.IsOpen == true && s_RabbitChannel?.IsOpen == true)
+            return true;
+
+        DisposeRabbitMq();
+
+        try
+        {
+            var factory = new ConnectionFactory
+            {
+                HostName = RabbitMqHost,
+                Port = RabbitMqPort,
+                UserName = RabbitMqUser,
+                Password = RabbitMqPass,
+                VirtualHost = RabbitMqVirtualHost,
+            };
+
+            s_RabbitConnection = factory.CreateConnectionAsync(CancellationToken.None).GetAwaiter().GetResult();
+            s_RabbitChannel = s_RabbitConnection.CreateChannelAsync(new CreateChannelOptions(false, false), CancellationToken.None).GetAwaiter().GetResult();
+            s_RabbitChannel.QueueDeclareAsync(
+                queue: RabbitMqQueueName,
+                durable: RabbitMqQueueDurable,
+                exclusive: false,
+                autoDelete: false,
+                arguments: null,
+                passive: false,
+                noWait: false,
+                cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+
+            s_RabbitReady = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            s_RabbitReady = false;
+            Debug.LogWarning($"[GaussianSplatInboxWatcher] RabbitMQ connection failed ({RabbitMqHost}:{RabbitMqPort}, queue '{RabbitMqQueueName}'): {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void DisposeRabbitMq()
+    {
+        try
+        {
+            s_RabbitChannel?.Dispose();
+            s_RabbitConnection?.Dispose();
+        }
+        catch
+        {
+        }
+        finally
+        {
+            s_RabbitChannel = null;
+            s_RabbitConnection = null;
+            s_RabbitReady = false;
         }
     }
 
@@ -181,41 +270,6 @@ public static class GaussianSplatInboxWatcher
             Debug.LogWarning($"[GaussianSplatInboxWatcher] Could not move '{sourceAssetPath}' to {destinationLabel} folder: {moveError}");
     }
 
-    private static bool IsStable(string filePath, FileFingerprint fingerprint)
-    {
-        var now = EditorApplication.timeSinceStartup;
-
-        if (!s_Observations.TryGetValue(filePath, out var obs))
-        {
-            s_Observations[filePath] = FileObservation.From(fingerprint, now);
-            return false;
-        }
-
-        bool sameFingerprint = obs.Size == fingerprint.Size && obs.LastWriteUtcTicks == fingerprint.LastWriteUtcTicks;
-        if (!sameFingerprint)
-        {
-            s_Observations[filePath] = FileObservation.From(fingerprint, now);
-            return false;
-        }
-
-        return now - obs.FirstSeenUnchangedAt >= FileStableForSeconds;
-    }
-
-    private static void CleanupMissingObservations(string[] existingFiles)
-    {
-        s_MissingObservationKeys.Clear();
-
-        var existing = new HashSet<string>(existingFiles, StringComparer.OrdinalIgnoreCase);
-        foreach (var key in s_Observations.Keys)
-        {
-            if (!existing.Contains(key))
-                s_MissingObservationKeys.Add(key);
-        }
-
-        foreach (var key in s_MissingObservationKeys)
-            s_Observations.Remove(key);
-    }
-
     private static bool TryGetFingerprint(string filePath, out FileFingerprint fingerprint)
     {
         fingerprint = default;
@@ -290,6 +344,20 @@ public static class GaussianSplatInboxWatcher
 
         string relative = assetPath.Substring("Assets".Length).TrimStart('/', '\\');
         return Path.Combine(Application.dataPath, relative);
+    }
+
+    private static string ResolveIncomingPath(string incoming)
+    {
+        if (string.IsNullOrWhiteSpace(incoming))
+            return string.Empty;
+
+        if (Path.IsPathRooted(incoming))
+            return Path.GetFullPath(incoming);
+
+        if (incoming.StartsWith("Assets", StringComparison.OrdinalIgnoreCase))
+            return AssetPathToAbsolute(incoming);
+
+        return Path.GetFullPath(Path.Combine(s_ProjectRoot, incoming));
     }
 
     private static string AbsoluteToAssetPath(string absolutePath)
@@ -412,20 +480,4 @@ public static class GaussianSplatInboxWatcher
         public long LastWriteUtcTicks;
     }
 
-    private struct FileObservation
-    {
-        public long Size;
-        public long LastWriteUtcTicks;
-        public double FirstSeenUnchangedAt;
-
-        public static FileObservation From(in FileFingerprint fingerprint, double now)
-        {
-            return new FileObservation
-            {
-                Size = fingerprint.Size,
-                LastWriteUtcTicks = fingerprint.LastWriteUtcTicks,
-                FirstSeenUnchangedAt = now,
-            };
-        }
-    }
 }
